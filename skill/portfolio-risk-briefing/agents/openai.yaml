@@ -1,0 +1,4 @@
+interface:
+  display_name: "Portfolio Risk Briefing"
+  short_description: "Build risk reports from positions and strategy notes."
+  default_prompt: "Generate a risk-focused portfolio report from live positions and project strategy files."
