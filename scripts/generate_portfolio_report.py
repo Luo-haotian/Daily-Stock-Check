@@ -96,6 +96,22 @@ def parse_expiry(code: str) -> Optional[datetime]:
     return datetime(year=2000 + yy, month=mm, day=dd)
 
 
+def parse_option_parts(code: str) -> Optional[Dict[str, object]]:
+    normalized = normalize_code(code)
+    match = re.match(r"^([A-Z]{1,8})(\d{6})([CP])(\d+)$", normalized)
+    if not match:
+        return None
+    underlying, yymmdd, option_type, strike_raw = match.groups()
+    yy, mm, dd = int(yymmdd[:2]), int(yymmdd[2:4]), int(yymmdd[4:6])
+    strike = int(strike_raw) / 1000.0
+    return {
+        "underlying": underlying,
+        "expiry": datetime(year=2000 + yy, month=mm, day=dd),
+        "option_type": option_type,
+        "strike": strike,
+    }
+
+
 def norm_cdf(x: float) -> float:
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
@@ -325,6 +341,51 @@ def today_change_pct(row: Dict) -> float:
     return today_pl / prev_market_value * 100.0
 
 
+def build_short_option_map(rows: List[Dict]) -> Dict[str, List[Dict]]:
+    short_map: Dict[str, List[Dict]] = {}
+    for row in rows:
+        qty = float(row.get("qty", 0) or 0)
+        if qty >= 0:
+            continue
+        parts = parse_option_parts(str(row.get("code", "")))
+        if not parts:
+            continue
+        entry = {
+            "code": normalize_code(str(row.get("code", ""))),
+            "qty": qty,
+            "pl_ratio": float(row.get("pl_ratio", 0) or 0),
+            "today_pl_val": float(row.get("today_pl_val", 0) or 0),
+            "currency": str(row.get("currency", "")).strip() or "N/A",
+            **parts,
+        }
+        short_map.setdefault(str(parts["underlying"]), []).append(entry)
+    for items in short_map.values():
+        items.sort(key=lambda item: item["expiry"])
+    return short_map
+
+
+def make_manage_existing_call_line(ticker: str, stock_name: str, short_calls: List[Dict]) -> str:
+    lead = short_calls[0]
+    dte = (lead["expiry"].date() - datetime.now().date()).days
+    return (
+        f"- {ticker} ({stock_name}): existing short call position detected "
+        f"({lead['code']} x{abs(int(lead['qty']))}, dte={dte}, pl={lead['pl_ratio']:.2f}%). "
+        f"Manage or roll the current call first; do not sell an additional call on top of it."
+    )
+
+
+def make_risk_watch_line(row: Dict, base_ccy: str, total_assets_base: float, usd_to_base: float) -> str:
+    ticker = to_underlying(str(row.get("code", "")))
+    stock_name = str(row.get("stock_name", "")).strip() or ticker
+    weight = to_base_value(row, usd_to_base, base_ccy) / total_assets_base * 100.0
+    day_pct = today_change_pct(row)
+    total_pl = float(row.get("pl_ratio", 0) or 0)
+    return (
+        f"- {ticker} ({stock_name}): watch only. Weight={weight:.2f}%, day move={day_pct:+.2f}%, "
+        f"total_pl={total_pl:.2f}%. No new option action suggested right now."
+    )
+
+
 def is_focus_row(row: Dict, focus_symbols: List[str]) -> bool:
     return to_underlying(str(row.get("code", ""))) in set(focus_symbols)
 
@@ -349,6 +410,7 @@ def main() -> int:
     account_info = payload.get("account_info", {}) or {}
     strategies = load_strategy_map(strategy_dir)
     now = datetime.now()
+    short_option_map = build_short_option_map(rows)
 
     equity_longs = []
     for row in rows:
@@ -366,6 +428,7 @@ def main() -> int:
         total_assets_base = sum(to_base_value(row, usd_to_base, base_ccy) for row in equity_longs) or 1.0
 
     focus_symbols = report_settings["focus_symbols"]
+    action_symbols = focus_symbols + [s for s in report_settings["secondary_symbols"] if s not in focus_symbols]
     focus_equity_longs = [row for row in equity_longs if is_focus_row(row, focus_symbols)]
     if not focus_equity_longs:
         focus_equity_longs = equity_longs[: min(5, len(equity_longs))]
@@ -387,7 +450,8 @@ def main() -> int:
     market_states = get_market_states(quote_ctx)
 
     candidates = []
-    for row in focus_equity_longs:
+    action_equity_longs = [row for row in equity_longs if is_focus_row(row, action_symbols)]
+    for row in action_equity_longs:
         ticker = to_underlying(str(row.get("code", "")))
         market = str(row.get("position_market", "")).upper()
         qty = float(row.get("qty", 0) or 0)
@@ -402,6 +466,14 @@ def main() -> int:
     for _, ticker, market, qty, row in candidates:
         if ticker in used or market != "US" or qty < 100:
             continue
+        stock_name = str(row.get("stock_name", "")).strip() or ticker
+        short_calls = [x for x in short_option_map.get(ticker, []) if x["option_type"] == "C"]
+        if short_calls:
+            action_lines.append(make_manage_existing_call_line(ticker, stock_name, short_calls))
+            used.add(ticker)
+            if len(action_lines) >= 5:
+                break
+            continue
         owner_code = str(row.get("code", ""))
         owner_code = owner_code if "." in owner_code else f"US.{ticker}"
         rec, day_pct, day_known = choose_call_candidate(
@@ -413,14 +485,16 @@ def main() -> int:
             target_delta=report_settings["covered_call_target_delta"],
         )
         if rec:
-            stock_name = str(row.get("stock_name", "")).strip() or ticker
             currency = str(row.get("currency", "")).strip() or "USD"
             day_text = f"{day_pct:+.2f}%" if day_known else "N/A(no live quote entitlement)"
             action_lines.append(
                 f"- {ticker} ({stock_name}, {currency}): if day gain reaches +3%, consider selling {rec['expiry']} {format_strike(rec['strike'])}C, est delta={rec['delta']:.2f}, mid premium about {rec['mid']:.2f}. Current day move={day_text}."
             )
             used.add(ticker)
-        if len(action_lines) >= 4:
+        else:
+            action_lines.append(make_risk_watch_line(row, base_ccy, total_assets_base, usd_to_base))
+            used.add(ticker)
+        if len(action_lines) >= 5:
             break
 
     if quote_ctx is not None:
@@ -489,4 +563,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
