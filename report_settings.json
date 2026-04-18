@@ -1,0 +1,17 @@
+{
+  "focus_symbols": [
+    "CRCL",
+    "HOOD",
+    "RKLB",
+    "CRWV",
+    "CMPS"
+  ],
+  "secondary_symbols": [
+    "ASPI",
+    "GOSS"
+  ],
+  "option_dte_max": 90,
+  "covered_call_min_dte": 7,
+  "covered_call_target_delta": 0.2
+}
+
